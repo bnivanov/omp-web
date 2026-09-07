@@ -191,7 +191,7 @@ describe("goal/plan local commands", () => {
 	});
 
 	test("/plan toggles planModeEnabled via setPlanModeState", () => {
-		const before = state.planModeEnabled;
+		const before = Boolean(state.planModeEnabled);
 		expect(planDispatch().args[0].enabled).toBe(!before);
 		expect(planDispatch().args[0].planFilePath).toBe("");
 		// Flip the store and confirm the toggle inverts.
