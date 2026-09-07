@@ -36,6 +36,7 @@
 - [x] `bun run check:types` passes cleanly.
 - [x] Created dedicated development branch `fleet-convergence` to track Convergence Blueprint work independently of upstream `main`.
 - [x] Committed and pushed Convergence Blueprint suite (`346d1fc`) and test suite fix (`3191ae4`, boolean-casting `state.planModeEnabled` in `src/prompt/commands.test.ts`) to `origin/fleet-convergence`.
+- [x] Verified active runtime: PID 7375 serving loopback (`http://127.0.0.1:4722`) and Tailscale (`https://bozhidars-macbook-air-2.tail6b3af5.ts.net:8443`) with `--tailscale-auth`.
 
 ---
 
