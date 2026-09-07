@@ -36,6 +36,9 @@ describe("loadConfig", () => {
 		expect(config.defaultTemplate).toBe("local");
 		expect(config.spawnHook).toBeUndefined();
 		expect(config.workspaceDir).toBe(join(homedir(), ".omp-web", "workspaces"));
+		expect(config.host).toBe("127.0.0.1");
+		expect(config.tailscaleAuth).toBe(false);
+		expect(config.token).toBeUndefined();
 	});
 
 	test("shallow-merges the file over defaults, tolerating unknown fields", async () => {

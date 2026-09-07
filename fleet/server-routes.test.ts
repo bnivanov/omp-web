@@ -8,6 +8,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, realpathSync } from "node:fs";
 import { basename, join } from "node:path";
+import type { DaemonEntry } from "../shared/protocol";
 import type { RegistryEntry } from "./registry";
 import type { FleetServer } from "./server";
 import {
@@ -38,7 +39,7 @@ describe("fleet control plane", () => {
 	let configPath: string;
 	let server: FleetServer;
 	let fake: FakeDaemon;
-	let entry: RegistryEntry;
+	let entry: DaemonEntry;
 
 	beforeAll(async () => {
 		({ tmp, statePath, configPath } = fleetPaths());
@@ -379,12 +380,13 @@ describe("fleet control plane", () => {
 	test("sessions list reflects the registry after add", async () => {
 		const res = await fetch(`http://127.0.0.1:${server.port}/ctl/sessions`);
 		expect(res.status).toBe(200);
-		const body = (await res.json()) as RegistryEntry[];
+		const body = (await res.json()) as DaemonEntry[];
 		const found = body.find((e) => e.daemonId === entry.daemonId);
 		expect(found).toBeDefined();
 		expect(found?.name).toBe("added");
 		expect(found?.status).toBe("ready");
-		expect(found?.endpoint).toBe(fake.url);
+		expect(found).not.toHaveProperty("token");
+		expect(found).not.toHaveProperty("endpoint");
 	});
 
 	test("GET /ctl/debug returns fleet facts, per-session internals, and the event log — never tokens", async () => {

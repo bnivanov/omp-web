@@ -65,7 +65,7 @@ interface ParsedArgs {
 const MULTI_FLAGS = new Set(["label"]);
 
 /** Flags that are bare booleans: presence = true (never consume a value); `--flag=true|false` also accepted. */
-const BOOLEAN_FLAGS = new Set(["start", "no-start", "delete-branch"]);
+const BOOLEAN_FLAGS = new Set(["start", "no-start", "delete-branch", "tailscale-auth"]);
 
 function parseArgs(argv: string[]): ParsedArgs {
 	const positionals: string[] = [];
@@ -319,7 +319,11 @@ export function readLine(prompt: string): Promise<string> {
 	});
 }
 
-async function serveCmd(port: number, workspaceDir?: string): Promise<number> {
+async function serveCmd(
+	port: number,
+	flags: Map<string, FlagValue>,
+	workspaceDir?: string,
+): Promise<number> {
 	// First-run auto-offer: no config file + an interactive terminal → verify
 	// the omp stack (installed / provider / default model), then ask whether
 	// to configure omp-web before booting.
@@ -356,17 +360,22 @@ async function serveCmd(port: number, workspaceDir?: string): Promise<number> {
 	}
 	// A second fleet on the same state file is a deterministic conflict, not
 	// a retryable failure: report the live holder and exit 77.
-	const server = await startFleet({ port, workspaceDir, configPath: offerConfigPath }).catch(
-		(err: unknown) => {
-			if (err instanceof LockHeldError) {
-				console.error(
-					`fleet already running (pid ${err.holderPid}) — state locked at ${err.lockPath}`,
-				);
-				return null;
-			}
-			throw err;
-		},
-	);
+	const server = await startFleet({
+		port,
+		workspaceDir,
+		configPath: offerConfigPath,
+		host: flagString(flags, "host"),
+		token: flagString(flags, "token"),
+		tailscaleAuth: flagBoolean(flags, "tailscale-auth"),
+	}).catch((err: unknown) => {
+		if (err instanceof LockHeldError) {
+			console.error(
+				`fleet already running (pid ${err.holderPid}) — state locked at ${err.lockPath}`,
+			);
+			return null;
+		}
+		throw err;
+	});
 	if (server === null) return 77;
 	return serveLoop(server);
 }
@@ -381,7 +390,7 @@ export async function serveLoop(server: FleetServer): Promise<number> {
 	// Startup banner: where the fleet listens, where its state/config live,
 	// and what a previous fleet run left behind (boot statuses). The first
 	// line keeps its exact shape — scripts parse the port out of it.
-	console.log(`fleet listening on 127.0.0.1:${server.port}`);
+	console.log(`fleet listening on ${server.hostname}:${server.port}`);
 	console.log(`fleet state: ${server.fleetFacts.statePath}`);
 	console.log(`fleet config: ${server.fleetFacts.configPath ?? "(defaults)"}`);
 	const restored = server.registry.list();
@@ -776,12 +785,99 @@ async function promptCmd(
 	return 0;
 }
 
+async function herdCmd(port: number): Promise<number> {
+	const body = (await ctl(port, "/ctl/herd")) as {
+		daemons?: Array<{
+			daemonId: string;
+			name: string;
+			status: string;
+			branch?: string;
+			pendingDialogs?: Array<{ epochToken: string; method: string }>;
+		}>;
+	};
+	if (!Array.isArray(body.daemons)) throw new CliError("unexpected herd response");
+	const rows = body.daemons.map((d) => [
+		d.daemonId,
+		d.name,
+		d.status,
+		d.branch ?? "",
+		String(d.pendingDialogs?.length ?? 0),
+	]);
+	console.log(renderTable(["id", "name", "status", "branch", "dialogs"], rows));
+	for (const d of body.daemons) {
+		for (const dlg of d.pendingDialogs ?? []) {
+			console.log(`  ${d.daemonId} ${dlg.method} ${dlg.epochToken}`);
+		}
+	}
+	return 0;
+}
+
+async function dialogReplyCmd(flags: Map<string, FlagValue>, port: number): Promise<number> {
+	const epochToken = flagString(flags, "epoch");
+	if (epochToken === undefined) {
+		throw new CliError("usage: omp-fleet dialog-reply --epoch <token> [--action a] [--result r]");
+	}
+	const action = flagString(flags, "action");
+	const resultRaw = flagString(flags, "result");
+	let result: unknown = resultRaw;
+	if (resultRaw === "true") result = true;
+	else if (resultRaw === "false") result = false;
+	const body = await ctl(port, "/ctl/dialog/reply", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({
+			epochToken,
+			action,
+			result,
+			idempotencyKey: flagString(flags, "idempotency"),
+		}),
+	});
+	console.log(JSON.stringify(body));
+	return 0;
+}
+
+async function ptySpawnCmd(flags: Map<string, FlagValue>, port: number): Promise<number> {
+	const command = flagString(flags, "command");
+	if (command === undefined)
+		throw new CliError("usage: omp-fleet pty-spawn --command <cmd> [--cwd d]");
+	const body = await ctl(port, "/ctl/pty", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ command, cwd: flagString(flags, "cwd") }),
+	});
+	console.log(JSON.stringify(body));
+	return 0;
+}
+
+async function ptyListCmd(port: number): Promise<number> {
+	const body = (await ctl(port, "/ctl/pty")) as {
+		workers?: Array<{ id: string; status: string; command: string }>;
+	};
+	if (!Array.isArray(body.workers)) throw new CliError("unexpected pty list");
+	const rows = body.workers.map((w) => [w.id, w.status, w.command]);
+	console.log(renderTable(["id", "status", "command"], rows));
+	return 0;
+}
+
+async function ptyKillCmd(positionals: string[], port: number): Promise<number> {
+	const id = positionals[0];
+	if (id === undefined) throw new CliError("usage: omp-fleet pty-kill <id>");
+	const body = await ctl(port, `/ctl/pty/${id}`, { method: "DELETE" });
+	console.log(JSON.stringify(body));
+	return 0;
+}
+
 const USAGE = `usage: omp-fleet <command> [options]
 
 commands:
   serve                        run the control plane (loopback HTTP)
   sessions                     list sessions
   projects                     list discovered projects
+  herd                         herd snapshot (status, dialogs, no tokens)
+  dialog-reply --epoch <t> [--action a] [--result r] [--idempotency k]
+  pty-spawn --command <cmd> [--cwd d]
+  pty-list
+  pty-kill <id>
   spawn <path> [--template t] [--name n] [--label k=v]…
   add-repo <path> [--start] [--template t] [--labels k=v,...]
   add <name> <url> --token <t> [--label k=v]… [--cwd c]
@@ -796,6 +892,9 @@ commands:
 
 options:
   --port <n>           control plane port (default 4722, env OMP_FLEET_PORT)
+  --host <addr>        bind address (default 127.0.0.1, env OMP_FLEET_HOST)
+  --token <t>          fleet operator bearer (env OMP_FLEET_TOKEN)
+  --tailscale-auth     trust Tailscale-User-Login from Tailscale IPs
   --workspace-dir <d>  managed worktree root (default ~/.omp-web/workspaces,
                        env OMP_FLEET_WORKSPACE_DIR)`;
 
@@ -812,11 +911,21 @@ export async function main(argv: string[]): Promise<number> {
 				console.log(USAGE);
 				return 0;
 			case "serve":
-				return await serveCmd(port, flagString(flags, "workspace-dir"));
+				return await serveCmd(port, flags, flagString(flags, "workspace-dir"));
 			case "sessions":
 				return await sessionsCmd(port);
 			case "projects":
 				return await projectsCmd(port);
+			case "herd":
+				return await herdCmd(port);
+			case "dialog-reply":
+				return await dialogReplyCmd(flags, port);
+			case "pty-spawn":
+				return await ptySpawnCmd(flags, port);
+			case "pty-list":
+				return await ptyListCmd(port);
+			case "pty-kill":
+				return await ptyKillCmd(rest, port);
 			case "spawn":
 				return await spawnCmd(rest, flags, port);
 			case "add-repo":

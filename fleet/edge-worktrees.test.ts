@@ -53,7 +53,7 @@ describe("edge worktree commands", () => {
 	}
 
 	beforeAll(async () => {
-		tmp = mkdtempSync(join(tmpdir(), "omp-web-edge-wt-"));
+		tmp = realpathSync(mkdtempSync(join(tmpdir(), "omp-web-edge-wt-")));
 		registry = new Registry(join(tmp, "state.json"));
 		await registry.load();
 		connector = new DaemonConnector(registry);

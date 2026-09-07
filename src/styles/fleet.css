@@ -68,8 +68,8 @@
    at its top-right). */
 .sidebar-toggle {
 	position: fixed;
-	top: var(--space-4);
-	left: var(--space-6);
+	top: calc(var(--space-4) + env(safe-area-inset-top));
+	left: calc(var(--space-6) + env(safe-area-inset-left));
 	z-index: var(--z-overlay);
 	display: flex;
 	align-items: center;

@@ -9,6 +9,7 @@
 	/* Full-viewport shell: the header floats to the edges; only the chat
 	   column (.app-main) is width-constrained and centered. */
 	padding: 0 var(--space-6);
+	padding-bottom: env(safe-area-inset-bottom);
 }
 .status-bar {
 	display: flex;

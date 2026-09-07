@@ -37,10 +37,19 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startFleet, type FleetServer } from "./server";
+import type { DaemonEntry } from "../shared/protocol";
 import type { RegistryEntry } from "./registry";
 import { parseContractLine } from "./spawn-parse";
 
@@ -113,12 +122,12 @@ describe("fleet integration — real omp-session daemons", () => {
 	let server!: FleetServer;
 	// Saved OMP_FLEET_* env for afterAll restore (see beforeAll scrub).
 	let savedFleetEnv: Record<string, string | undefined> = {};
-	let d1!: RegistryEntry;
-	let d2!: RegistryEntry;
-	let d3!: RegistryEntry;
-	let d4!: RegistryEntry;
+	let d1!: DaemonEntry;
+	let d2!: DaemonEntry;
+	let d3!: DaemonEntry;
+	let d4!: DaemonEntry;
 	let ext!: ExtDaemon;
-	let extEntry!: RegistryEntry;
+	let extEntry!: DaemonEntry;
 	/** Every child pid we have seen (spawn responses + restarts + external). */
 	const trackedPids = new Set<number>();
 	/** Prompts issued through the control plane (all error-out, no live model). */
@@ -134,13 +143,13 @@ describe("fleet integration — real omp-session daemons", () => {
 		});
 	}
 
-	async function listDaemons(): Promise<RegistryEntry[]> {
+	async function listDaemons(): Promise<DaemonEntry[]> {
 		const res = await fetch(`${base()}/ctl/sessions`);
 		if (res.status !== 200) throw new Error(`GET /ctl/sessions → ${res.status}`);
-		return (await res.json()) as RegistryEntry[];
+		return (await res.json()) as DaemonEntry[];
 	}
 
-	async function getEntry(id: string): Promise<RegistryEntry | undefined> {
+	async function getEntry(id: string): Promise<DaemonEntry | undefined> {
 		return (await listDaemons()).find((entry) => entry.daemonId === id);
 	}
 
@@ -151,13 +160,13 @@ describe("fleet integration — real omp-session daemons", () => {
 	 */
 	async function waitForEntry(
 		id: string,
-		predicate: (entry: RegistryEntry) => boolean,
+		predicate: (entry: DaemonEntry) => boolean,
 		timeoutMs: number,
 		what: string,
-	): Promise<{ entry: RegistryEntry; seen: string[] }> {
+	): Promise<{ entry: DaemonEntry; seen: string[] }> {
 		const deadline = Date.now() + timeoutMs;
 		const seen: string[] = [];
-		let last: RegistryEntry | undefined;
+		let last: DaemonEntry | undefined;
 		while (Date.now() < deadline) {
 			last = await getEntry(id);
 			if (last) {
@@ -262,7 +271,7 @@ describe("fleet integration — real omp-session daemons", () => {
 				"integration tests must run from the repo root: bun test fleet/integration.test.ts",
 			);
 		}
-		tmp = mkdtempSync(join(tmpdir(), "omp-web-integration-"));
+		tmp = realpathSync(mkdtempSync(join(tmpdir(), "omp-web-integration-")));
 		statePath = join(tmp, "state.json");
 		configPath = join(tmp, "config.json");
 		// Hermetic per-daemon agent dir ({name} expands per daemon in the fleet
@@ -381,7 +390,7 @@ describe("fleet integration — real omp-session daemons", () => {
 		trackedPids.add(d1.pid!);
 		trackedPids.add(d2.pid!);
 		trackedPids.add(d3.pid!);
-		const isReady = (entry: RegistryEntry) => entry.status === "ready";
+		const isReady = (entry: DaemonEntry) => entry.status === "ready";
 		const [a, b, c] = await Promise.all([
 			waitForEntry(d1.daemonId, isReady, 60_000, "become ready"),
 			waitForEntry(d2.daemonId, isReady, 60_000, "become ready"),
@@ -417,7 +426,8 @@ describe("fleet integration — real omp-session daemons", () => {
 
 	test("SIGKILL one child: roster shows reconnecting, supervisor restarts with a fresh token", async () => {
 		const before = (await getEntry(d2.daemonId))!;
-		const tokenBefore = before.token!;
+		const diskBefore = JSON.parse(readFileSync(statePath, "utf8")) as { entries: RegistryEntry[] };
+		const tokenBefore = diskBefore.entries.find((e) => e.daemonId === d2.daemonId)?.token;
 		const pidBefore = before.pid!;
 		const sessionBefore = before.lastSessionFile!;
 		expect(tokenBefore).toBeTruthy();
@@ -439,17 +449,18 @@ describe("fleet integration — real omp-session daemons", () => {
 		// Then the supervisor restarts the child (fresh token, new pid) and it returns to ready.
 		const recovered = await waitForEntry(
 			d2.daemonId,
-			(e) => e.status === "ready" && e.token !== tokenBefore,
+			(e) => e.status === "ready" && e.pid !== pidBefore,
 			90_000,
-			"recover to ready with a fresh token",
+			"recover to ready with a fresh child pid",
 		);
 		const after = recovered.entry;
-		expect(after.token).not.toBe(tokenBefore);
 		expect(after.pid).not.toBe(pidBefore);
 		trackedPids.add(after.pid!);
 		// The fresh token is persisted: every registry mutation writes state.json.
-		const disk = JSON.parse(readFileSync(statePath, "utf8")) as { entries: RegistryEntry[] };
-		expect(disk.entries.find((e) => e.daemonId === d2.daemonId)?.token).toBe(after.token);
+		const diskAfter = JSON.parse(readFileSync(statePath, "utf8")) as { entries: RegistryEntry[] };
+		const tokenAfter = diskAfter.entries.find((e) => e.daemonId === d2.daemonId)?.token;
+		expect(tokenAfter).toBeTruthy();
+		expect(tokenAfter).not.toBe(tokenBefore);
 		// R3 on the crash path: the restarted child resumed the same session file.
 		expect(after.lastSessionFile).toBe(sessionBefore);
 	}, 90_000);

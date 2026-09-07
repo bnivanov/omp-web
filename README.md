@@ -16,8 +16,11 @@ Because it drives the agent through the SDK instead of the RPC, omp-web has full
 - **Custom wire protocol for full SDK control.** The SSE + POST contract carries the full SDK surface, including daemon and subagent control the RPC doesn't expose.
 - **Manage repos and worktrees from the UI.** Register projects (deduped by realpath), create or adopt managed worktrees, and delete them safely: clean-tree-only, `git branch -d`, no `--force`.
 - **CLI for automation.** Spawn, stop, remove, inspect, and fan a prompt out to many daemons from the terminal, the same fleet the browser talks to.
+- **Remote steering without a browser.** `GET /ctl/herd` is a token-free snapshot for bots. `POST /ctl/dialog/reply` answers a live dialog by epoch. Telegram inline keyboards and Web Push (VAPID) fire from an observer stream that does not pin daemon idle-exit.
+- **Installable PWA.** Manifest + service worker in `public/`. `notificationclick` and `?daemon=` attach the matching roster row.
 - **Self-updating.** `omp-web update` checks the release channel and reinstalls the latest version in one command.
 - **Self-healing.** Idle daemons exit after 30 minutes and are respawned on demand; crashed daemons restart with bounded backoff; dropped connections show `reconnecting` and browsers re-attach automatically.
+
 
 ## Runtime modes
 
@@ -29,8 +32,9 @@ Because it drives the agent through the SDK instead of the RPC, omp-web has full
 
 ```mermaid
 flowchart TB
-  browser["Web UI (Solid.js)"]
-  fleet["<b>omp-web</b> <br/>serves web UI, registry, supervisor, proxy"]
+  browser["Web UI / PWA (Solid.js)"]
+  bots["Telegram / CLI /ctl/herd"]
+  fleet["<b>omp-web</b> <br/>serves web UI, registry, supervisor, proxy, observer"]
   model["Model provider"]
   log["session .jsonl, durable truth"]
 
@@ -40,12 +44,15 @@ flowchart TB
   end
 
   browser <-->|"SSE + POST"| fleet
+  bots -->|"herd + dialog-reply"| fleet
   fleet <-->|"proxied SSE + POST"| daemons
+  fleet -.->|"observer tap, no idle pin"| daemons
   daemons <--> model
   daemons -.-> log
 ```
 
-Deep dive into [`docs/architecture.md`](docs/architecture.md): wire contract, module map, security model.
+Deep dive: [`docs/architecture.md`](docs/architecture.md) (wire + modules), [`docs/position.md`](docs/position.md) (vs TUI/`omp-gui`), [`docs/CONVERGENCE_BLUEPRINT.md`](docs/CONVERGENCE_BLUEPRINT.md) (as-built remote/mobile surface).
+
 
 ## Requirements
 
@@ -84,9 +91,10 @@ omp-web update --version x.y.z  # pin a specific release
 ## Configuration and State
 
 - Default data directory: `~/.omp-web/`
-- `config.json` (defaults, written only by the first-run offer)
+- `config.json` (defaults, written only by the first-run offer). Optional `notifications.vapid` and `notifications.telegram` (or `OMP_FLEET_VAPID_*` / `OMP_FLEET_TELEGRAM_*`). Without those, subscribe and Telegram dispatch are no-ops.
 - `fleet-state.json` (roster + registered projects, atomic writes, exclusive pidfile lock)
 - `workspaces/` (managed worktrees, created lazily). Chosen at first run; config, state, and workspaces always live together under it.
+- Off-loopback fleet bind (`--host` / `OMP_FLEET_HOST`) requires `--token` / `OMP_FLEET_TOKEN` or `--tailscale-auth`.
 
 ## Develop
 
@@ -109,7 +117,10 @@ state, so the roster boots empty); the next plain `bun dev` forks again.
 
 ```sh
 omp-web session [options]            # run a single-session agent daemon
-omp-web sessions | projects          # roster / registered projects
+omp-web sessions | projects | herd   # roster / registered projects / snapshot
+omp-web dialog-reply --epoch <n> --action a [--result r] [--idempotency k]
+omp-web pty-spawn --command <cmd> [--cwd d]
+omp-web pty-list | pty-kill <id>
 omp-web spawn <path>                 # start a daemon on a directory
 omp-web add-repo <path> [--start]    # register a project (deduped on realpath)
 omp-web add-worktree <project> <name> [--no-start]      # create a managed worktree
@@ -118,6 +129,7 @@ omp-web stop <selector> | remove <selector>
 omp-web rm-project <selector> | rm-worktree <daemon-id> [--delete-branch]
 omp-web prompt <selector> <text> [--wait <ms>]
 ```
+
 
 ## Manual install
 

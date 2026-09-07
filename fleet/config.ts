@@ -25,6 +25,11 @@ export interface SpawnTemplate {
 	host?: string;
 }
 
+export interface FleetNotificationConfig {
+	vapid?: { publicKey: string; privateKey: string; subject: string };
+	telegram?: { botToken: string; chatId: string; webhookSecret?: string; poll?: boolean };
+}
+
 export interface FleetConfig {
 	templates: Record<string, SpawnTemplate>;
 	defaultTemplate: string;
@@ -41,6 +46,13 @@ export interface FleetConfig {
 	 * config-file `workspaceDir` key > `~/.omp-web/workspaces` (~ expanded).
 	 */
 	workspaceDir: string;
+	/** Bind address. Default 127.0.0.1. Flag/env win over the file. */
+	host?: string;
+	/** Fleet operator bearer for off-loopback callers. Never serialized to roster. */
+	token?: string;
+	/** Trust Tailscale-User-Login from Tailscale IP space. */
+	tailscaleAuth?: boolean;
+	notifications?: FleetNotificationConfig;
 }
 
 /**
@@ -63,6 +75,8 @@ function defaultConfig(): FleetConfig {
 		templates: { local: { ...DEFAULT_LOCAL_TEMPLATE } },
 		defaultTemplate: "local",
 		workspaceDir: defaultWorkspaceDir(),
+		host: "127.0.0.1",
+		tailscaleAuth: false,
 	};
 }
 
@@ -75,7 +89,7 @@ export function expandTilde(p: string): string {
 
 export async function loadConfig(
 	path?: string,
-	opts?: { workspaceDir?: string },
+	opts?: { workspaceDir?: string; host?: string; token?: string; tailscaleAuth?: boolean },
 ): Promise<FleetConfig> {
 	const file = resolveConfigPath(path);
 	let config: FleetConfig;
@@ -102,6 +116,16 @@ export async function loadConfig(
 	if (flagDir !== undefined && flagDir !== "") {
 		config.workspaceDir = expandTilde(flagDir);
 	}
+	const envHost = process.env.OMP_FLEET_HOST;
+	if (opts?.host !== undefined && opts.host !== "") config.host = opts.host;
+	else if (envHost !== undefined && envHost !== "") config.host = envHost;
+	const envToken = process.env.OMP_FLEET_TOKEN;
+	if (opts?.token !== undefined && opts.token !== "") config.token = opts.token;
+	else if (envToken !== undefined && envToken !== "") config.token = envToken;
+	const envTs = process.env.OMP_FLEET_TAILSCALE_AUTH;
+	if (opts?.tailscaleAuth !== undefined) config.tailscaleAuth = opts.tailscaleAuth;
+	else if (envTs === "1" || envTs === "true") config.tailscaleAuth = true;
+	applyNotificationEnv(config);
 	return config;
 }
 
@@ -133,14 +157,76 @@ function mergeConfig(raw: unknown): FleetConfig {
 	} else if (typeof file.spawnHook === "string") {
 		config.spawnHook = expandTilde(file.spawnHook);
 	}
-	// Env `OMP_FLEET_WORKSPACE_DIR` wins over the config-file key.
 	const workspaceDir = process.env.OMP_FLEET_WORKSPACE_DIR;
 	if (workspaceDir !== undefined && workspaceDir !== "") {
 		config.workspaceDir = expandTilde(workspaceDir);
 	} else if (typeof file.workspaceDir === "string") {
 		config.workspaceDir = expandTilde(file.workspaceDir);
 	}
+	if (typeof file.host === "string" && file.host !== "") config.host = file.host;
+	if (typeof file.token === "string" && file.token !== "") config.token = file.token;
+	if (file.tailscaleAuth === true) config.tailscaleAuth = true;
+	const notifications = parseNotifications(file.notifications);
+	if (notifications) config.notifications = notifications;
 	return config;
+}
+
+function parseNotifications(raw: unknown): FleetNotificationConfig | undefined {
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+	const file = raw as Record<string, unknown>;
+	const out: FleetNotificationConfig = {};
+	if (typeof file.vapid === "object" && file.vapid !== null && !Array.isArray(file.vapid)) {
+		const v = file.vapid as Record<string, unknown>;
+		if (
+			typeof v.publicKey === "string" &&
+			typeof v.privateKey === "string" &&
+			typeof v.subject === "string"
+		) {
+			out.vapid = { publicKey: v.publicKey, privateKey: v.privateKey, subject: v.subject };
+		}
+	}
+	if (
+		typeof file.telegram === "object" &&
+		file.telegram !== null &&
+		!Array.isArray(file.telegram)
+	) {
+		const t = file.telegram as Record<string, unknown>;
+		if (typeof t.botToken === "string" && typeof t.chatId === "string") {
+			out.telegram = {
+				botToken: t.botToken,
+				chatId: t.chatId,
+				webhookSecret: typeof t.webhookSecret === "string" ? t.webhookSecret : undefined,
+				poll: t.poll === true,
+			};
+		}
+	}
+	if (!out.vapid && !out.telegram) return undefined;
+	return out;
+}
+
+function applyNotificationEnv(config: FleetConfig): void {
+	const pub = process.env.OMP_FLEET_VAPID_PUBLIC_KEY;
+	const priv = process.env.OMP_FLEET_VAPID_PRIVATE_KEY;
+	const sub = process.env.OMP_FLEET_VAPID_SUBJECT;
+	const bot = process.env.OMP_FLEET_TELEGRAM_BOT_TOKEN;
+	const chat = process.env.OMP_FLEET_TELEGRAM_CHAT_ID;
+	if (pub && priv && sub) {
+		config.notifications = {
+			...config.notifications,
+			vapid: { publicKey: pub, privateKey: priv, subject: sub },
+		};
+	}
+	if (bot && chat) {
+		config.notifications = {
+			...config.notifications,
+			telegram: {
+				botToken: bot,
+				chatId: chat,
+				webhookSecret: process.env.OMP_FLEET_TELEGRAM_WEBHOOK_SECRET,
+				poll: process.env.OMP_FLEET_TELEGRAM_POLL === "1",
+			},
+		};
+	}
 }
 
 function isTemplateMap(value: unknown): value is Record<string, SpawnTemplate> {

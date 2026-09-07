@@ -5,6 +5,7 @@
  * collection, and polling helpers. Named *.testkit.ts so bun test discovery
  * never picks it up as a suite.
  */
+import { mkdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { OMP_PROTO, SSE_DELTA_SEQ_START, SSE_EVENT_NAME } from "../shared/protocol";
 import type { DaemonEntry, DaemonInfo, ServerFrame } from "../shared/protocol";
@@ -15,7 +16,9 @@ import type { FleetEdge } from "./edge";
 export { cleanupTempDirs };
 
 /** Fake omp-session cwd — under a testkit temp dir so the afterAll reaps it. */
-export const FAKE_CWD = join(tempDir("omp-web-edge-fake-cwd-"), "fake-proj");
+const fakeCwdRaw = join(tempDir("omp-web-edge-fake-cwd-"), "fake-proj");
+mkdirSync(fakeCwdRaw, { recursive: true });
+export const FAKE_CWD = realpathSync(fakeCwdRaw);
 export const FAKE_SESSION_FILE = join(FAKE_CWD, ".omp", "session.json");
 export const FAKE_TOKEN = "sekret";
 /** A wire-safe DaemonInfo (hub launch / broker roster entry) for fake emissions. */

@@ -1,6 +1,14 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { RegisteredProject } from "../shared/protocol";
@@ -26,7 +34,7 @@ import {
 const tmpDirs: string[] = [];
 
 function tmpDir(): string {
-	const dir = mkdtempSync(join(tmpdir(), "omp-web-worktrees-"));
+	const dir = realpathSync(mkdtempSync(join(tmpdir(), "omp-web-worktrees-")));
 	tmpDirs.push(dir);
 	return dir;
 }

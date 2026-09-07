@@ -335,6 +335,7 @@ async function openEventsResponse(req: Request): Promise<Response> {
 					controller: controller as ReadableStreamDefaultController<Uint8Array>,
 					attached: null,
 					unreadEstimate: 0,
+					observer: new URL(req.url).searchParams.get("role") === "observer",
 				};
 				consumer = c;
 				streams.add(c);
@@ -1096,7 +1097,9 @@ void bootReadiness(bootEntry);
 // ---------------------------------------------------------------------------
 
 function isIdleSuppressed(): boolean {
-	if (streams.size > 0) return true;
+	for (const stream of streams) {
+		if (!stream.observer) return true;
+	}
 	if (getInFlightBash() > 0 || getInFlightPython() > 0) return true;
 	if (bootEntry) {
 		if (bootEntry.session.isStreaming) return true;

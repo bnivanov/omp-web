@@ -12,6 +12,8 @@ body {
 	line-height: 1.5;
 	-webkit-font-smoothing: antialiased;
 	text-rendering: optimizeLegibility;
+	padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+		env(safe-area-inset-left);
 }
 /* finding #P1: visually-hidden utility for the aria-live status region — kept
  * in the layout for screen readers, clipped out of the visual/paint surface. */

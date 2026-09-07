@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { main } from "./cli";
+import type { DaemonEntry } from "../shared/protocol";
 import type { RegistryEntry } from "./registry";
 import { runSpawnHook, startFleet, type FleetServer } from "./server";
 import {
@@ -78,15 +79,16 @@ describe("POST /ctl/provision (spawn hook)", () => {
 			labels: ["env=prod", "team=x"],
 		});
 		expect(res.status).toBe(200);
-		const body = (await res.json()) as RegistryEntry;
+		const body = (await res.json()) as DaemonEntry;
 		expect(body.mode).toBe("remote");
 		expect(body.name).toBe("hook-sandbox-a"); // hook name wins over the requested name
 		expect(body.labels).toEqual(["env=prod", "team=x"]);
 		expect(body.cwd).toBe("/srv/sandbox");
 		expect(body.project).toBe("sandbox");
-		expect(body.endpoint).toBe(`ws://127.0.0.1:${hookFake.port}`);
-		expect(body.token).toBe("hook-token");
 		expect(body.status).toBe("connecting");
+		expect(body).not.toHaveProperty("endpoint");
+		expect(body).not.toHaveProperty("token");
+		expect(hookServer.registry.get(body.daemonId)?.token).toBe("hook-token");
 		// The connector must dial the printed endpoint with the Bearer token.
 		await waitFor(() => hookFake.seen.authHeader !== null, 5000, "provision dial");
 		expect(hookFake.seen.authHeader).toBe("Bearer hook-token");

@@ -6,20 +6,20 @@
  * browser SSE edge (/events + /command) on the same server. Wires the
  * persistent Registry, the remote DaemonConnector and the SpawnSupervisor:
  *
- *   GET  /ctl/sessions {…}                         → RegistryEntry[]
+ *   GET  /ctl/sessions {…}                         → DaemonEntry[]
  *   GET  /ctl/projects {…}                         → { projects: ProjectEntry[], registered: RegisteredProject[] }
- *   POST /ctl/projects {path, start?, template?, labels?} → 201 { project, entry? } | 409 { error, project }
+ *   POST /ctl/projects {path, start?, template?, labels?} → 201 { project, entry?: DaemonEntry } | 409 { error, project }
  *   DELETE /ctl/projects/:projectId                → 200 { removed } | 409 { error }
  *   GET  /ctl/settings                             -> SettingsModel
  *   GET  /ctl/worktrees/:daemonId/delete-info      -> worktree_delete_info payload
- *   POST /ctl/spawn    {cwd, template?, name?, labels?} -> RegistryEntry
- *   POST /ctl/add      {name, url, token?, labels?, cwd?} → RegistryEntry
- *   POST /ctl/provision {name, labels?}            → RegistryEntry (spawn hook)
+ *   POST /ctl/spawn    {cwd, template?, name?, labels?} -> DaemonEntry
+ *   POST /ctl/add      {name, url, token?, labels?, cwd?} → DaemonEntry
+ *   POST /ctl/provision {name, labels?}            → DaemonEntry (spawn hook)
  *   POST /ctl/stop     {selector}                  → { stopped: string[] }
  *   POST /ctl/remove   {selector}                  → { removed: string[] }
  *   POST /ctl/prompt   {selector, text, waitMs?}   → PromptResult[] | { submitted: string[] }
  *   POST /ctl/settings/set {path, value}           -> SettingsModel (400 bad path/value)
- *   POST /ctl/projects/:id/worktrees               -> create or add-existing worktree -> 201 { entry }
+ *   POST /ctl/projects/:id/worktrees               -> create or add-existing worktree -> 201 { entry: DaemonEntry }
  *   DELETE /ctl/worktrees/:daemonId {deleteBranch?} -> stop -> remove entry -> git worktree remove
  *
  * /ctl/provision runs config.spawnHook via `sh -c` with env OMP_HOOK_NAME /
@@ -54,10 +54,20 @@ import { SpawnSupervisor } from "./supervisor";
 import { isValidEndpointUrl } from "./spawn-parse";
 import type { FanoutDeps } from "./fanout";
 import { fanOut } from "./fanout";
-import { FleetEdge } from "./edge";
+import { FleetEdge, toRosterEntry } from "./edge";
 import { FleetEventLog, type FleetFacts } from "./events";
 import { createFleetSettings, type FleetSettings, type FleetSettingsOptions } from "./settings";
 import { createStatsApp } from "./stats/index";
+import { assertFleetBindSafe, authorizeFleetRequest, type FleetAuthConfig } from "./auth";
+import { DialogIdempotency, parseDialogReply, resolveDialogResult } from "./dialog-reply";
+import { NotificationDispatcher } from "./notifications/dispatcher";
+import { TelegramAttachStore } from "./notifications/telegram-attach";
+import { TelegramInboundRouter } from "./notifications/telegram-inbound";
+import { ObserverBroker, dialogResponseCommand } from "./observer";
+import { HerdProjector } from "./projector";
+import { PtySupervisor } from "./pty-supervisor";
+import { encodeSseEvent } from "../shared/sse";
+import { SSE_EVENT_NAME } from "../shared/protocol";
 import {
 	createWorktree,
 	deleteWorktree,
@@ -85,6 +95,7 @@ const statsApp = createStatsApp();
 /** Control plane as consumed by the CLI (and, in Phase 3, the edge server). */
 export interface FleetServer {
 	port: number;
+	hostname: string;
 	registry: Registry;
 	connector: DaemonConnector;
 	supervisor: SpawnSupervisor;
@@ -92,6 +103,8 @@ export interface FleetServer {
 	eventLog: FleetEventLog;
 	/** Fleet-wide facts (port/startedAt/state paths) for the banner + /ctl/debug. */
 	fleetFacts: FleetFacts;
+	telegramInbound?: TelegramInboundRouter;
+	telegramAttach?: TelegramAttachStore;
 	close(): Promise<void>;
 }
 
@@ -316,12 +329,14 @@ function parseHookOutput(stdout: string): HookOutput {
 
 class FleetServerImpl implements FleetServer {
 	readonly port: number;
+	readonly hostname: string;
 	readonly registry: Registry;
 	readonly connector: DaemonConnector;
 	readonly supervisor: SpawnSupervisor;
 	readonly config: FleetConfig;
 	readonly edge: FleetEdge;
 	readonly fleetSettings: FleetSettings;
+	readonly projector = new HerdProjector();
 	readonly eventLog = new FleetEventLog();
 	readonly startedAt: number;
 	readonly fleetFacts: FleetFacts;
@@ -329,8 +344,15 @@ class FleetServerImpl implements FleetServer {
 	readonly lock: FileLock;
 
 	readonly #server: Server<undefined>;
+	readonly #auth: FleetAuthConfig;
+	readonly #notifications: NotificationDispatcher;
+	readonly telegramInbound?: TelegramInboundRouter;
+	readonly telegramAttach?: TelegramAttachStore;
+	readonly #observer: ObserverBroker;
+	readonly #ptys = new PtySupervisor();
+	readonly #dialogIdem = new DialogIdempotency();
 	/**
-	 * daemonIds mid-eviction for a poll-detected, vanished worktree. The
+	 * Only one vanished-worktree event handler per daemon per
 	 * supervisor can fire per poll tick; the first report wins and the set
 	 * is cleared when the eviction settles.
 	 */
@@ -347,6 +369,8 @@ class FleetServerImpl implements FleetServer {
 		this.registry = registry;
 		this.config = config;
 		this.lock = lock;
+		this.hostname = config.host ?? "127.0.0.1";
+		this.#auth = { token: config.token, tailscaleAuth: config.tailscaleAuth === true };
 		this.startedAt = Date.now();
 		this.fleetFacts = {
 			port: 0,
@@ -354,11 +378,19 @@ class FleetServerImpl implements FleetServer {
 			statePath: facts.statePath,
 			configPath: facts.configPath,
 		};
+		this.#notifications = new NotificationDispatcher(config.notifications ?? {});
+		this.#notifications.onTelegramReply = (binding) => {
+			void this.#applyDialogReply({
+				epochToken: binding.epochToken,
+				action: binding.action,
+				result: binding.result,
+			});
+		};
 		let edge: FleetEdge | null = null;
 		this.connector = new DaemonConnector(registry, {
-			onDialFailed: (entry) => this.#onDialFailed(entry),
 			onStatus: (entry) => {
 				edge?.onDaemonStatus(entry);
+				this.#observer.onStatus(entry);
 				// #22: a spawned child that reaches the connector's "ready"
 				// transition is stable — the supervisor resets its
 				// consecutive-crash budget there (window-based, not lifetime).
@@ -379,6 +411,13 @@ class FleetServerImpl implements FleetServer {
 					daemonId,
 				);
 			},
+			onDisconnect: (daemonId) => this.#observer.onDisconnect(daemonId),
+		});
+		this.#observer = new ObserverBroker({
+			registry,
+			connector: this.connector,
+			projector: this.projector,
+			notifications: this.#notifications,
 		});
 		this.supervisor = new SpawnSupervisor(registry, this.connector, config, {
 			onEvent: (level, message, daemonId) =>
@@ -394,6 +433,27 @@ class FleetServerImpl implements FleetServer {
 			fleet: this.fleetFacts,
 		});
 		this.edge = edge;
+		if (config.notifications?.telegram && this.#notifications.telegram) {
+			const attachPath = join(dirname(facts.statePath), "telegram-attach.json");
+			this.telegramAttach = new TelegramAttachStore(attachPath);
+			this.telegramInbound = new TelegramInboundRouter({
+				registry: this.registry,
+				connector: this.connector,
+				supervisor: this.supervisor,
+				projector: this.projector,
+				dispatcher: this.#notifications.telegram,
+				attachStore: this.telegramAttach,
+				notifications: this.#notifications,
+				ownerChatId: config.notifications.telegram.chatId,
+				onDialogReply: (binding) => {
+					void this.#applyDialogReply({
+						epochToken: binding.epochToken,
+						action: binding.action,
+						result: binding.result,
+					});
+				},
+			});
+		}
 		// Unattached settings service (roster-mode /ctl/settings): lazy
 		// Settings.init + ModelRegistry, no live session required. Injectable
 		// provider source for tests (must not open the real auth DB).
@@ -408,13 +468,14 @@ class FleetServerImpl implements FleetServer {
 		// Keep branch + dirty counts fresh for local entries; close() clears
 		// the timer via supervisor.close().
 		this.supervisor.startGitStatePolling();
+		this.#notifications.start();
 		this.#server = Bun.serve({
-			hostname: "127.0.0.1", // loopback-only control API + browser edge (Phase 3)
+			hostname: this.hostname,
 			port,
 			// SSE responses are long-lived and quiet between 15s keepalive
 			// pings; Bun's default 10s fetch idleTimeout would kill them.
 			idleTimeout: 0,
-			fetch: (req) => this.#fetch(req),
+			fetch: (req, srv) => this.#fetch(req, srv),
 		});
 		this.port = this.#server.port!;
 		this.fleetFacts.port = this.port;
@@ -422,6 +483,21 @@ class FleetServerImpl implements FleetServer {
 
 	async close(): Promise<void> {
 		const errors: unknown[] = [];
+		try {
+			this.#observer.close();
+		} catch (err) {
+			errors.push(err);
+		}
+		try {
+			this.#notifications.stop();
+		} catch (err) {
+			errors.push(err);
+		}
+		try {
+			this.#ptys.close();
+		} catch (err) {
+			errors.push(err);
+		}
 		try {
 			this.edge.close();
 		} catch (err) {
@@ -509,7 +585,10 @@ class FleetServerImpl implements FleetServer {
 		return { registry: this.registry, connector: this.connector, supervisor: this.supervisor };
 	}
 
-	#fetch = async (req: Request): Promise<Response> => {
+	#fetch = async (req: Request, srv: Server<undefined>): Promise<Response> => {
+		const peer = srv.requestIP(req)?.address ?? null;
+		const auth = authorizeFleetRequest(req, peer, this.#auth);
+		if (!auth.ok) return json({ error: auth.error }, auth.status);
 		// Edge routes first: /events (SSE), /command (POST), the /ctl routes,
 		// and static dist. null = not an edge route.
 		const edgeHandled = await this.edge.handleFetch(req);
@@ -524,13 +603,26 @@ class FleetServerImpl implements FleetServer {
 				const statsHandled = await statsApp.handleFetch(req, url);
 				if (statsHandled !== null) return statsHandled;
 			}
+			const ptyEvents = /^\/ctl\/pty\/([^/]+)\/events$/.exec(path);
+			if (ptyEvents && req.method === "GET") return this.#handlePtyEvents(ptyEvents[1]!);
+			const ptyOne = /^\/ctl\/pty\/([^/]+)$/.exec(path);
+			const ptyInput = /^\/ctl\/pty\/([^/]+)\/input$/.exec(path);
 			if (req.method === "GET") {
 				// Delete-confirmation evidence for one worktree daemon.
 				const infoMatch = WORKTREE_INFO_ROUTE.exec(path);
 				if (infoMatch) return await this.#handleWorktreeDeleteInfo(infoMatch[1]);
+				if (ptyOne) return this.#handlePtyGet(ptyOne[1]!);
 				switch (path) {
 					case "/ctl/sessions":
-						return json(this.registry.list());
+						return json(
+							this.registry.list().map((entry) => toRosterEntry(entry, this.config.workspaceDir)),
+						);
+					case "/ctl/herd":
+						return json(this.projector.snapshot(this.registry.list()));
+					case "/ctl/push/vapid":
+						return this.#handlePushVapid();
+					case "/ctl/pty":
+						return json({ workers: this.#ptys.list() });
 					case "/ctl/projects": {
 						// The registered set is the only project source (no root
 						// scanning). Each registered project also contributes its
@@ -556,6 +648,7 @@ class FleetServerImpl implements FleetServer {
 				// add-existing ({worktreePath, start?}) for one project.
 				const worktreesMatch = PROJECT_WORKTREES_ROUTE.exec(path);
 				if (worktreesMatch) return await this.#handleCreateOrAddWorktree(req, worktreesMatch[1]);
+				if (ptyInput) return await this.#handlePtyInput(req, ptyInput[1]!);
 				switch (path) {
 					case "/ctl/projects":
 						return await this.#handleAddProject(req);
@@ -573,6 +666,16 @@ class FleetServerImpl implements FleetServer {
 						return await this.#handlePrompt(req);
 					case "/ctl/settings/set":
 						return await this.#handleSettingsSet(req);
+					case "/ctl/dialog/reply":
+						return await this.#handleDialogReply(req);
+					case "/ctl/push/subscribe":
+						return await this.#handlePushSubscribe(req);
+					case "/ctl/push/unsubscribe":
+						return await this.#handlePushUnsubscribe(req);
+					case "/ctl/telegram/webhook":
+						return await this.#handleTelegramWebhook(req);
+					case "/ctl/pty":
+						return await this.#handlePtySpawn(req);
 					default:
 						return json({ error: "not found" }, 404);
 				}
@@ -583,6 +686,7 @@ class FleetServerImpl implements FleetServer {
 				// Worktree deletion: stop daemon -> remove entry -> git worktree remove.
 				const worktreeMatch = WORKTREE_DELETE_ROUTE.exec(path);
 				if (worktreeMatch) return await this.#handleDeleteWorktree(req, worktreeMatch[1]);
+				if (ptyOne) return this.#handlePtyDelete(ptyOne[1]!);
 				return json({ error: "not found" }, 404);
 			}
 			return json({ error: "method not allowed" }, 405);
@@ -598,6 +702,143 @@ class FleetServerImpl implements FleetServer {
 			return json({ error: message }, 500);
 		}
 	};
+
+	async #applyDialogReply(body: {
+		epochToken: string;
+		action?: string;
+		result?: unknown;
+		idempotencyKey?: string;
+	}): Promise<{ status: "applied" | "already_applied" | "expired" }> {
+		const dialog = this.projector.getDialog(body.epochToken);
+		if (!dialog) return { status: "expired" };
+		const key = body.idempotencyKey ?? body.epochToken;
+		if (!this.#dialogIdem.claim(key)) return { status: "already_applied" };
+		const resolved = resolveDialogResult(dialog, body.action, body.result);
+		if ("error" in resolved) throw new HttpError(400, resolved.error);
+		const parts = body.epochToken.split(":");
+		const requestId = parts[parts.length - 1]!;
+		const daemonId = parts.slice(0, -2).join(":");
+		const sent = this.connector.send(daemonId, dialogResponseCommand(requestId, resolved.result));
+		if (!sent) return { status: "expired" };
+		this.projector.clearDialog(body.epochToken);
+		return { status: "applied" };
+	}
+
+	async #handleDialogReply(req: Request): Promise<Response> {
+		const parsed = parseDialogReply(await readJson(req));
+		if ("error" in parsed) throw new HttpError(400, parsed.error);
+		return json(await this.#applyDialogReply(parsed));
+	}
+
+	#handlePushVapid(): Response {
+		const key = this.#notifications.webpush?.publicKey();
+		if (!key) throw new HttpError(404, "web push is not configured");
+		return json({ publicKey: key });
+	}
+
+	async #handlePushSubscribe(req: Request): Promise<Response> {
+		if (!this.#notifications.webpush) throw new HttpError(404, "web push is not configured");
+		const sub = this.#notifications.subscribePush(await readJson(req));
+		if (!sub) throw new HttpError(400, "invalid push subscription");
+		return json({ ok: true, endpoint: sub.endpoint });
+	}
+
+	async #handlePushUnsubscribe(req: Request): Promise<Response> {
+		const body = await readJson(req);
+		const endpoint = body.endpoint;
+		if (typeof endpoint !== "string" || endpoint.length === 0) {
+			throw new HttpError(400, "missing field: endpoint");
+		}
+		this.#notifications.unsubscribePush(endpoint);
+		return json({ ok: true });
+	}
+
+	async #handleTelegramWebhook(req: Request): Promise<Response> {
+		const tg = this.#notifications.telegram;
+		if (!tg) throw new HttpError(404, "telegram is not configured");
+		if (!tg.webhookAuthorized(req.headers)) throw new HttpError(401, "Unauthorized");
+		let raw: unknown;
+		try {
+			raw = await req.json();
+		} catch {
+			throw new HttpError(400, "invalid JSON body");
+		}
+		tg.handleUpdate(raw);
+		return json({ ok: true });
+	}
+
+	async #handlePtySpawn(req: Request): Promise<Response> {
+		const body = await readJson(req);
+		const command = requireString(body, "command");
+		const cwd = optionalString(body, "cwd");
+		const args = body.args;
+		let argv: string[] | undefined;
+		if (args !== undefined) {
+			if (!Array.isArray(args) || args.some((a) => typeof a !== "string")) {
+				throw new HttpError(400, "invalid field: args");
+			}
+			argv = args as string[];
+		}
+		try {
+			return json(this.#ptys.spawn({ command, args: argv, cwd }), 201);
+		} catch (err) {
+			throw new HttpError(400, err instanceof Error ? err.message : String(err));
+		}
+	}
+
+	#handlePtyGet(id: string): Response {
+		const snap = this.#ptys.get(id);
+		if (!snap) throw new HttpError(404, `unknown pty: ${id}`);
+		return json(snap);
+	}
+
+	async #handlePtyInput(req: Request, id: string): Promise<Response> {
+		const body = await readJson(req);
+		const data = requireString(body, "data");
+		if (!this.#ptys.write(id, data)) throw new HttpError(404, `unknown or stopped pty: ${id}`);
+		return json({ ok: true });
+	}
+
+	#handlePtyDelete(id: string): Response {
+		if (!this.#ptys.remove(id)) throw new HttpError(404, `unknown pty: ${id}`);
+		return json({ removed: id });
+	}
+
+	#handlePtyEvents(id: string): Response {
+		const snap = this.#ptys.get(id);
+		if (!snap) throw new HttpError(404, `unknown pty: ${id}`);
+		const encoder = new TextEncoder();
+		let off: (() => void) | undefined;
+		const stream = new ReadableStream<Uint8Array>({
+			start: (controller) => {
+				controller.enqueue(
+					encoder.encode(encodeSseEvent(SSE_EVENT_NAME, { type: "pty_snapshot", ...snap }, 1)),
+				);
+				let seq = 2;
+				off = this.#ptys.subscribe(id, (chunk) => {
+					try {
+						controller.enqueue(
+							encoder.encode(
+								encodeSseEvent(SSE_EVENT_NAME, { type: "pty_chunk", id, text: chunk }, seq++),
+							),
+						);
+					} catch {
+						off?.();
+					}
+				});
+			},
+			cancel: () => {
+				off?.();
+			},
+		});
+		return new Response(stream, {
+			headers: {
+				"content-type": "text/event-stream",
+				"cache-control": "no-cache",
+				"x-accel-buffering": "no",
+			},
+		});
+	}
 
 	async #handleSpawn(req: Request): Promise<Response> {
 		const body = await readJson(req);
@@ -622,7 +863,9 @@ class FleetServerImpl implements FleetServer {
 		// under the project. Unregistered paths stay untagged (fallback group).
 		const projectId = await projectIdForCwd(this.registry.projects(), resolved);
 		if (projectId !== undefined) this.registry.update(entry.daemonId, { projectId });
-		return json(this.registry.get(entry.daemonId) ?? entry);
+		return json(
+			toRosterEntry(this.registry.get(entry.daemonId) ?? entry, this.config.workspaceDir),
+		);
 	}
 
 	/**
@@ -670,7 +913,10 @@ class FleetServerImpl implements FleetServer {
 			});
 			// `entry` only when spawned: an asleep default workspace surfaces
 			// purely via the roster broadcast.
-			return json({ project, ...(start ? { entry } : {}) }, 201);
+			return json(
+				{ project, ...(start ? { entry: toRosterEntry(entry, this.config.workspaceDir) } : {}) },
+				201,
+			);
 		} catch (err) {
 			// The project stays registered; the 500 names the stage.
 			throw new HttpError(
@@ -718,7 +964,7 @@ class FleetServerImpl implements FleetServer {
 		});
 		this.connector.connect(entry.daemonId);
 		this.eventLog.add("info", "server", `added ${entry.name} (${url})`, entry.daemonId);
-		return json(entry);
+		return json(toRosterEntry(entry, this.config.workspaceDir));
 	}
 
 	/**
@@ -754,7 +1000,7 @@ class FleetServerImpl implements FleetServer {
 		});
 		this.connector.connect(entry.daemonId);
 		this.eventLog.add("info", "server", `provisioned ${entry.name} (spawn hook)`, entry.daemonId);
-		return json(entry);
+		return json(toRosterEntry(entry, this.config.workspaceDir));
 	}
 
 	async #handleStop(req: Request): Promise<Response> {
@@ -932,7 +1178,7 @@ class FleetServerImpl implements FleetServer {
 				`worktree created ${created.path} (${created.branch})`,
 				entry.daemonId,
 			);
-			return json({ entry }, 201);
+			return json({ entry: toRosterEntry(entry, this.config.workspaceDir) }, 201);
 		}
 		// Add-existing: validate it is an unregistered linked worktree of the project.
 		let resolved: string;
@@ -956,7 +1202,7 @@ class FleetServerImpl implements FleetServer {
 			throw new HttpError(500, `spawn failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
 		this.eventLog.add("info", "server", `worktree registered ${resolved}`, entry.daemonId);
-		return json({ entry }, 201);
+		return json({ entry: toRosterEntry(entry, this.config.workspaceDir) }, 201);
 	}
 
 	/**
@@ -1039,11 +1285,23 @@ export async function startFleet(
 		statePath?: string;
 		configPath?: string;
 		workspaceDir?: string;
+		host?: string;
+		token?: string;
+		tailscaleAuth?: boolean;
 		settings?: FleetSettingsOptions;
 	} = {},
 ): Promise<FleetServer> {
 	const configPath = resolveConfigPath(opts.configPath);
-	const config = await loadConfig(opts.configPath, { workspaceDir: opts.workspaceDir });
+	const config = await loadConfig(opts.configPath, {
+		workspaceDir: opts.workspaceDir,
+		host: opts.host,
+		token: opts.token,
+		tailscaleAuth: opts.tailscaleAuth,
+	});
+	assertFleetBindSafe(config.host ?? "127.0.0.1", {
+		token: config.token,
+		tailscaleAuth: config.tailscaleAuth === true,
+	});
 	const statePath = resolveStatePath(opts.statePath, configPath);
 	// One fleet per state file: the O_EXCL pidfile lock fails loudly when a
 	// second fleet starts against the same state (no clobbering writes).

@@ -14,7 +14,15 @@
  * test/sync.test.ts.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveStatsConfig } from "../fleet/stats/config";
@@ -60,7 +68,7 @@ const getHealth = (): Promise<Response | null> =>
 	);
 
 beforeAll(() => {
-	tmpDir = mkdtempSync(join(tmpdir(), "sync-timeout-"));
+	tmpDir = realpathSync(mkdtempSync(join(tmpdir(), "sync-timeout-")));
 	binDir = join(tmpDir, "bin");
 	syncBinDir = join(tmpDir, "syncbin");
 	emptyDir = join(tmpDir, "empty");
@@ -99,7 +107,7 @@ afterAll(() => {
 
 describe("POST /ctl/stats/sync — default runner", () => {
 	test("times out: kills the omp child and returns 504", async () => {
-		syncConfig.timeoutMs = 400;
+		syncConfig.timeoutMs = 1500;
 		const pidfile = join(tmpDir, "omp.pid");
 		process.env.PATH = `${binDir}:${savedPath ?? ""}`;
 		process.env.OMP_PIDFILE = pidfile;

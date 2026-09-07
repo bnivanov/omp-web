@@ -1,5 +1,6 @@
 import { createSignal, For, Show } from "solid-js";
 import { appearanceWebImages } from "../../prefs/settings";
+import { enablePushNotifications } from "../../pwa";
 import { call, fleetSettingsActive, setNotifyEnabled, setState, state } from "../../state";
 import { MinusIcon, PlusIcon } from "../shared/icons";
 import {
@@ -73,7 +74,11 @@ export function WebUiSettings(props: { model: SettingsModel; visibleGroup: strin
 							type="checkbox"
 							aria-label="desktop notifications"
 							checked={state.notifyEnabled}
-							onChange={(e) => setNotifyEnabled(e.currentTarget.checked)}
+							onChange={(e) => {
+								const on = e.currentTarget.checked;
+								setNotifyEnabled(on);
+								if (on) void enablePushNotifications();
+							}}
 						/>
 					</Row>
 					<Row label="reveal queue">

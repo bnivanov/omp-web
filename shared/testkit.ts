@@ -6,7 +6,7 @@
  * in an imported module are attributed to whichever file imported it first and
  * are skipped for the rest of a multi-file run.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,7 +18,7 @@ const tracked: string[] = [];
  * suite runs never leak dirs.
  */
 export function tempDir(prefix: string): string {
-	const dir = mkdtempSync(join(tmpdir(), prefix));
+	const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
 	tracked.push(dir);
 	return dir;
 }

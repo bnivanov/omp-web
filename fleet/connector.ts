@@ -65,6 +65,8 @@ export interface ConnectorEvents {
 	onDialFailed?: (entry: RegistryEntry) => void;
 	/** A reconnect was scheduled: attempt is 1-based, delayMs the backoff wait. */
 	onReconnect?: (daemonId: string, attempt: number, delayMs: number) => void;
+	/** Control stream closed (idle-drop, stop, or close). Status may still be ready. */
+	onDisconnect?: (daemonId: string) => void;
 }
 
 const DEFAULT_BACKOFF_MIN_MS = 1_000;
@@ -187,7 +189,6 @@ export class DaemonConnector {
 		this.#dial(state, entry);
 	}
 
-	/** Intentional drop: no reconnect, no status change (idle policy / stop of attached|remote). */
 	disconnect(daemonId: string): void {
 		const state = this.#states.get(daemonId);
 		if (!state) return;
@@ -204,6 +205,7 @@ export class DaemonConnector {
 		this.#clearSilenceTimer(state);
 		const abort = state.abort;
 		state.abort = null;
+		const wasOpen = state.streamOpen;
 		state.streamOpen = false;
 		if (abort) {
 			try {
@@ -212,6 +214,7 @@ export class DaemonConnector {
 				// Already aborted; the consume loop is guarded by state.closed.
 			}
 		}
+		if (wasOpen || abort) this.#events?.onDisconnect?.(daemonId);
 	}
 
 	/**

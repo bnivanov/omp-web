@@ -1,14 +1,16 @@
 # omp-web: System architecture
 
-Overall architecture for omp-session + omp-fleet. Product positioning lives in [`position.md`](position.md); per-command usage is in the [README](../README.md).
+Overall architecture for omp-session + omp-fleet. Product positioning lives in [`position.md`](position.md); convergence as-built spec in [`CONVERGENCE_BLUEPRINT.md`](CONVERGENCE_BLUEPRINT.md); per-command usage is in the [README](../README.md).
 
 ## Topology
 
 ```
-browser (Solid, one app, two modes)
+browser / PWA (Solid, one app, two modes)
    ⇄ SSE/POST ⇄ omp-session (standalone: full single-session UI)
    ⇄ SSE/POST ⇄ omp-fleet (roster mode) ⇄ per-browser proxied SSE/POST ⇄ omp-session …
                                       ⇄ control SSE/POST ⇄ omp-session …  (remote: ssh -L / tailnet / direct)
+                                      ⇄ GET /ctl/herd, POST /ctl/dialog/reply  (bots / CLI)
+Telegram / WebPush  ← observer tap (ui_request, agent_end; does not pin idle)
 ```
 
 One web app, two modes. Standalone: the browser talks to one omp-session daemon directly. Roster: the browser talks to omp-fleet's edge, which proxies each attached browser through to the selected daemon.
@@ -90,7 +92,7 @@ Module map (split along the seams identified in the 2026-08 audit):
 - `session-entry.ts`, `settings-model.ts`, `config.ts`: session state snapshots, settings model + side effects, flag/env parsing.
 - `collab-host.ts`, `collab-relay.ts`, `collab-session.ts`, `collab-cli.ts`: the collab room machinery (see below).
 
-Lifecycle gates: a **boot gate** preserves connect-implies-attached for streams that race session creation; a **readiness gate** fails prompt-family calls with `not_ready` until provider/model/auth resolution completes and the daemon broadcasts `ready`. **Idle exit:** with no attached clients, running agent/queue, in-flight bash/eval, open dialog, or live collab room, the daemon exits cleanly after the idle timeout: the `.jsonl` is already durable.
+Lifecycle gates: a **boot gate** preserves connect-implies-attached for streams that race session creation; a **readiness gate** fails prompt-family calls with `not_ready` until provider/model/auth resolution completes and the daemon broadcasts `ready`. **Idle exit:** with no attached *non-observer* clients, running agent/queue, in-flight bash/eval, open dialog, or live collab room, the daemon exits cleanly after the idle timeout: the `.jsonl` is already durable. `GET /events?role=observer` sets `SseConsumer.observer` and does **not** suppress idle (fleet observer / notify path).
 
 ## omp-fleet (`fleet/`)
 
@@ -106,11 +108,17 @@ Holds the registry of N daemons and zero SDK state: all agent truth lives in the
 - `fanout.ts` + `selectors.ts`: `dN` / `all` / glob / `label:k=v` / `project:name` selectors and fan-out prompting with per-turn correlation on each target's `agent_end`.
 - `events.ts`: `FleetEventLog` + `FleetFacts`: capped lifecycle-event ring (daemon status changes, spawn/exit/respawn, control-route failures; default 500 entries) fed to `/ctl/debug` and the serve-mode CLI banner; entries never hold secrets.
 - `settings.ts`: the unattached settings surface (`/ctl/settings`): lazily initializes the process-global `Settings` singleton (the same instance a session reads) and builds the wire `SettingsModel` from `server/settings-model` metadata, persisting coerced values without live session side effects.
-- `server.ts` + `cli.ts`: loopback control API and the `omp-fleet` CLI; `daemons-aggregator.ts`: the aggregated daemons panel feed. Control-plane routes added by onboarding: `GET /ctl/projects` → `{ projects: ProjectEntry[], registered: RegisteredProject[] }` (discovery stays ephemeral + read-only; the registered set is merged alongside), `POST /ctl/projects` `{path, start?, template?, labels?}` → `201 {project, entry?}` | `400` bad path | `409` dedup (already registered), `DELETE /ctl/projects/:projectId` → `200 {removed}` | `409` naming referencing daemons | `404`, `POST /ctl/projects/:id/worktrees` (create-new `{name, baseRef?, existingBranch?, start?}` | add-existing `{worktreePath, start?}`) → `201 {entry}`, `GET /ctl/worktrees/:daemonId/delete-info` → guard-evidence payload (never deletes), `DELETE /ctl/worktrees/:daemonId` `{deleteBranch?}` → stop → evict → `git worktree remove`; ownership + dirty guards run BEFORE any mutation (`403` unowned / `409` dirty, no `--force`), and transcripts live under the agent dir, never inside the worktree.
+- `auth.ts`: fleet operator gate for every `fetch` (`/ctl`, `/command`, `/events`). Loopback CLI (no Origin) allowed; off-loopback needs bearer or Tailscale-User-Login from CGNAT; mutating browser calls need CSRF (`x-omp-csrf`, same-origin, or loopback-to-loopback Origin). `assertFleetBindSafe` refuses a non-loopback bind without token or `--tailscale-auth`.
+- `projector.ts` + `dialog-reply.ts`: in-memory herd read-model (`GET /ctl/herd`, no tokens/endpoints) and epoch-scoped `POST /ctl/dialog/reply` (`applied` / `already_applied` / `expired`).
+- `observer.ts`: taps connector frames; after idle-drop of a still-ready daemon, dials `/events?role=observer`. Feeds projector + notifications. Does not pin daemon idle-exit.
+- `notifications/`: WebPush (VAPID, RFC 8291/8292) + Telegram (inline keyboards, short `tN` callback ids). Optional; no-op without config/env keys.
+- `pty-supervisor.ts`: isolated non-OMP process runner (`/ctl/pty*`, 512 KiB ring, max 32 workers). Not an SDK daemon template.
+- `server.ts` + `cli.ts`: control API and the `omp-fleet` / `omp-web` CLI (including `herd`, `dialog-reply`, `pty-*`, `--host` / `--token` / `--tailscale-auth`); `daemons-aggregator.ts`: the aggregated daemons panel feed. Control-plane routes added by onboarding: `GET /ctl/projects` → `{ projects: ProjectEntry[], registered: RegisteredProject[] }` (discovery stays ephemeral + read-only; the registered set is merged alongside), `POST /ctl/projects` `{path, start?, template?, labels?}` → `201 {project, entry?}` | `400` bad path | `409` dedup (already registered), `DELETE /ctl/projects/:projectId` → `200 {removed}` | `409` naming referencing daemons | `404`, `POST /ctl/projects/:id/worktrees` (create-new `{name, baseRef?, existingBranch?, start?}` | add-existing `{worktreePath, start?}`) → `201 {entry}`, `GET /ctl/worktrees/:daemonId/delete-info`. Also `GET /ctl/herd`, `POST /ctl/dialog/reply`, `/ctl/push/*`, `/ctl/telegram/webhook`, `/ctl/pty*`.
 
 ## Browser client (`src/`)
 
-One Solid app. `state.ts` is the store: chat items, streaming, session-state mirror, roster state, `call()` helper over POST, reconnect with backoff, and a stale-frame guard keyed on the stamped `sessionId` so frames from a previously attached daemon are never applied to the current view. `App.tsx` holds exactly one mode branch (the DaemonSidebar); everything else (subagent drill-down, settings, export, pickers, login, `/btw`, goal, usage) works identically in both modes.
+One Solid app. `state.ts` is the store: chat items, streaming, session-state mirror, roster state, `call()` helper over POST, reconnect with backoff, and a stale-frame guard keyed on the stamped `sessionId` so frames from a previously attached daemon are never applied to the current view. `App.tsx` holds exactly one mode branch (the DaemonSidebar); everything else (subagent drill-down, settings, export, pickers, login, `/btw`, goal, usage) works identically in both modes. `src/pwa.ts` registers `public/sw.js`, optionally subscribes Web Push via `/ctl/push/*`, and honors `?daemon=` / `notificationclick` deep links. Manifest and icon live under `public/`.
+
 
 ## State ownership
 
@@ -120,8 +128,10 @@ The SDK session and its `.jsonl` log are the single agent truth. The fleet regis
 
 - **Dial-in only:** omp-fleet initiates every connection; omp-session never dials out and has no `--fleet` flag. A sandbox image knows nothing of the external world; egress may be denied entirely.
 - **Per-daemon bearer tokens** minted at spawn; a leaked token gates that one daemon only. Loopback exempt; off-loopback requires the token plus a secure transport (ssh `-L`, tailnet, or own TLS).
-- **Roster hygiene:** tokens/endpoints/templates never serialize into roster frames.
+- **Fleet operator auth:** every fleet `fetch` runs `authorizeFleetRequest`. Off-loopback needs `config.token` or Tailscale identity (`--tailscale-auth` + `Tailscale-User-Login` from `100.64/10`). Binding a non-loopback host without those is a startup error. Mutating browser calls need CSRF; loopback CLI (no Origin) is allowed.
+- **Roster hygiene:** tokens/endpoints/templates never serialize into roster frames, `/ctl/herd`, or `/ctl/debug`.
 - **Egress:** `/download` is realpath-jailed to the bound cwd + tmpdir + session dirs: the only file-egress path; `list_files` never escapes the cwd.
+
 
 ## Collab (the WebSocket exception)
 

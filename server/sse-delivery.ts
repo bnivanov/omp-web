@@ -39,6 +39,8 @@ export interface SseConsumer {
 	 * Reset once a reader becomes visible and desiredSize reports the truth.
 	 */
 	unreadEstimate: number;
+	/** Fleet observer: receives frames but does not suppress idle auto-exit. */
+	observer?: boolean;
 }
 
 /** Every live /events stream. The daemon boot (index.ts) adds/removes consumers and reads the size. */

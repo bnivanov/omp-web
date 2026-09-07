@@ -5,7 +5,8 @@
  * Installed via `bun install -g` as the bundled `dist-bundle/cli.js`; bun
  * links it to `~/.bun/bin/omp-web` from the package `bin` field. Routes:
  *
- *   omp-web (bare) | omp-web serve|sessions|projects|spawn|add-repo|add|
+ *   omp-web (bare) | omp-web serve|sessions|projects|herd|dialog-reply|
+ *           pty-spawn|pty-list|pty-kill|spawn|add-repo|add|
  *           provision|stop|remove|rm-project|add-worktree|rm-worktree|prompt
  *                                     → fleet control-plane CLI (fleet/cli.ts;
  *                                       bare = serve)
@@ -28,6 +29,11 @@ const FLEET_SUBCOMMANDS: Record<string, true> = {
 	serve: true,
 	sessions: true,
 	projects: true,
+	herd: true,
+	"dialog-reply": true,
+	"pty-spawn": true,
+	"pty-list": true,
+	"pty-kill": true,
 	spawn: true,
 	"add-repo": true,
 	add: true,
@@ -58,7 +64,9 @@ const USAGE = `usage: omp-web [serve] [options] | omp-web <command> [options]
 
   (bare) | serve               start the fleet (registry + supervisor + edge);
                                first run with no config on a TTY offers setup
-  sessions | projects          list registered daemons / projects
+  sessions | projects | herd   list daemons / projects / herd snapshot
+  dialog-reply                 answer a live dialog by epoch token
+  pty-spawn | pty-list | pty-kill
   spawn | add-repo | add | provision | stop | remove
   rm-project | add-worktree | rm-worktree | prompt
                                fleet control plane (see: omp-web <command> --help)
